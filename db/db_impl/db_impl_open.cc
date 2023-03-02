@@ -1901,6 +1901,8 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
 
   if (s.ok()) {
     // set column family handles
+    std::vector<ColumnFamilyDescriptor> missing_cf_desc{/* */};
+    std::vector<size_t> missing_cf_idx{/* */};
     for (auto cf : column_families) {
       auto cfd =
           impl->versions_->GetColumnFamilySet()->GetColumnFamily(cf.name);
@@ -1910,19 +1912,26 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
         impl->NewThreadStatusCfInfo(cfd);
       } else {
         if (db_options.create_missing_column_families) {
-          // missing column family, create it
-          ColumnFamilyHandle* handle = nullptr;
-          impl->mutex_.Unlock();
-          s = impl->CreateColumnFamily(cf.options, cf.name, &handle);
-          impl->mutex_.Lock();
-          if (s.ok()) {
-            handles->push_back(handle);
-          } else {
-            break;
-          }
+          // missing column family, create it later
+          missing_cf_idx.push_back(handles->size());
+          missing_cf_desc.emplace_back(cf.name, cf.options);
+          handles->push_back(nullptr);
         } else {
           s = Status::InvalidArgument("Column family not found", cf.name);
           break;
+        }
+      }
+    }
+    if (s.ok() && !missing_cf_desc.empty()) {
+      // create missing column families, in one batch
+      std::vector<ColumnFamilyHandle*> missing_cf_handles(
+          missing_cf_desc.size(), nullptr);
+      impl->mutex_.Unlock();
+      s = impl->CreateColumnFamilies(missing_cf_desc, &missing_cf_handles);
+      impl->mutex_.Lock();
+      if (s.ok()) {
+        for (size_t i = 0; i < missing_cf_desc.size(); ++i) {
+          (*handles)[missing_cf_idx[i]] = missing_cf_handles[i];
         }
       }
     }
