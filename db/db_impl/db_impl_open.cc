@@ -1900,9 +1900,10 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
   }
 
   if (s.ok()) {
-    // set column family handles
+    // store missing column families, for batched creation
     std::vector<ColumnFamilyDescriptor> missing_cf_desc{/* */};
     std::vector<size_t> missing_cf_idx{/* */};
+    // set column family handles
     for (auto cf : column_families) {
       auto cfd =
           impl->versions_->GetColumnFamilySet()->GetColumnFamily(cf.name);
@@ -1913,9 +1914,9 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
       } else {
         if (db_options.create_missing_column_families) {
           // missing column family, create it later
-          missing_cf_idx.push_back(handles->size());
+          missing_cf_idx.emplace_back(handles->size());
           missing_cf_desc.emplace_back(cf.name, cf.options);
-          handles->push_back(nullptr);
+          handles->emplace_back(nullptr);
         } else {
           s = Status::InvalidArgument("Column family not found", cf.name);
           break;
@@ -1923,16 +1924,28 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
       }
     }
     if (s.ok() && !missing_cf_desc.empty()) {
-      // create missing column families, in one batch
-      std::vector<ColumnFamilyHandle*> missing_cf_handles(
-          missing_cf_desc.size(), nullptr);
+      // create missing column families in one batch
+      assert(missing_cf_desc.size() == missing_cf_idx.size());
+      std::vector<ColumnFamilyHandle*> missing_cf_handles{/* */};
+
       impl->mutex_.Unlock();
       s = impl->CreateColumnFamilies(missing_cf_desc, &missing_cf_handles);
       impl->mutex_.Lock();
-      if (s.ok()) {
-        for (size_t i = 0; i < missing_cf_desc.size(); ++i) {
-          (*handles)[missing_cf_idx[i]] = missing_cf_handles[i];
+
+      // We mimic previous unbatched implementation resiszing handles to the
+      // first failed column family creation.
+      assert(missing_cf_handles.size() <= missing_cf_idx.size());
+      for (size_t i = 0; i < missing_cf_handles.size(); ++i) {
+        (*handles)[missing_cf_idx[i]] = missing_cf_handles[i];
+      }
+      if (missing_cf_handles.size() < missing_cf_idx.size()) {
+        for (size_t i = missing_cf_idx[missing_cf_handles.size()] + 1;
+             i < handles->size(); ++i) {
+          if ((*handles)[i] != nullptr) {
+            delete (*handles)[i];
+          }
         }
+        handles->resize(missing_cf_idx[missing_cf_handles.size()]);
       }
     }
   }
@@ -1959,7 +1972,8 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
       if (cfd->ioptions()->merge_operator != nullptr &&
           !cfd->mem()->IsMergeOperatorSupported()) {
         s = Status::InvalidArgument(
-            "The memtable of column family %s does not support merge operator "
+            "The memtable of column family %s does not support merge "
+            "operator "
             "its options.merge_operator is non-null",
             cfd->GetName().c_str());
       }
@@ -1999,10 +2013,11 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
     // Notify SstFileManager about all sst files that already exist in
     // db_paths[0] and cf_paths[0] when the DB is opened.
 
-    // SstFileManagerImpl needs to know sizes of the files. For files whose size
-    // we already know (sst files that appear in manifest - typically that's the
-    // vast majority of all files), we'll pass the size to SstFileManager.
-    // For all other files SstFileManager will query the size from filesystem.
+    // SstFileManagerImpl needs to know sizes of the files. For files whose
+    // size we already know (sst files that appear in manifest - typically
+    // that's the vast majority of all files), we'll pass the size to
+    // SstFileManager. For all other files SstFileManager will query the size
+    // from filesystem.
 
     std::vector<ColumnFamilyMetaData> metadata;
     impl->GetAllColumnFamilyMetaData(&metadata);
